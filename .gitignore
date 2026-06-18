@@ -141,6 +141,7 @@ outputs_test_strawberry/
 outputs_test_bottle/
 outputs_test/
 outputs_cpu_probe/
+strawberry_server_jobs*/
 
 # Local Hugging Face / BERT model cache
 bert-base-uncased/
