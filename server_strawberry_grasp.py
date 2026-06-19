@@ -199,6 +199,15 @@ def update_manifest(job_dir: Path, updates: Dict[str, Any]) -> None:
     write_json(manifest, {**current, **updates})
 
 
+def disable_runtime_checkpointing(model: torch.nn.Module) -> int:
+    disabled = 0
+    for module in model.modules():
+        if hasattr(module, "use_checkpoint") and module.use_checkpoint:
+            module.use_checkpoint = False
+            disabled += 1
+    return disabled
+
+
 class GroundedSamEngine:
     def __init__(self, settings: argparse.Namespace):
         self.settings = settings
@@ -220,6 +229,11 @@ class GroundedSamEngine:
             str(settings.bert_base_uncased_path),
             device=self.device,
         ).to(self.device)
+        disabled_checkpoint_modules = disable_runtime_checkpointing(self.grounding_model)
+        print(
+            f"[strawberry-server] disabled checkpoint modules={disabled_checkpoint_modules}",
+            flush=True,
+        )
         self.grounding_model.eval()
         self.predictor = SamPredictor(
             sam_model_registry["vit_h"](checkpoint=str(settings.sam_checkpoint)).to(self.device)
