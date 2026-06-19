@@ -10,23 +10,43 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import cv2
-import numpy as np
-from fastapi import FastAPI, File, Form, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
-
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib-gsa-server")
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT / "GroundingDINO"))
+sys.path.insert(0, str(PROJECT_ROOT / "segment_anything"))
+
+import cv2
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+from fastapi import BackgroundTasks, FastAPI, File, Form, UploadFile
+from fastapi.responses import FileResponse, JSONResponse
+
+from grounded_sam_demo import (
+    SamPredictor,
+    get_grounding_output,
+    load_image,
+    load_model,
+    sam_model_registry,
+    save_mask_data,
+    show_box,
+    show_mask,
+)
+
 DEFAULT_JOBS_DIR = PROJECT_ROOT / "strawberry_server_jobs"
 DEFAULT_CONFIG = PROJECT_ROOT / "GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
 DEFAULT_GROUNDED_CHECKPOINT = PROJECT_ROOT / "groundingdino_swint_ogc.pth"
 DEFAULT_SAM_CHECKPOINT = PROJECT_ROOT / "sam_vit_h_4b8939.pth"
+DEFAULT_BERT_BASE_UNCASED_PATH = PROJECT_ROOT / "bert-base-uncased"
 DEFAULT_DEVICE = "cuda"
 EXPECTED_WIDTH = 640
 EXPECTED_HEIGHT = 480
@@ -50,7 +70,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     parser.add_argument("--grounded-checkpoint", default=str(DEFAULT_GROUNDED_CHECKPOINT))
     parser.add_argument("--sam-checkpoint", default=str(DEFAULT_SAM_CHECKPOINT))
+    parser.add_argument("--bert-base-uncased-path", default=str(DEFAULT_BERT_BASE_UNCASED_PATH))
     return parser.parse_args()
+
+
+def log_event(job_id: str, message: str) -> None:
+    stamp = datetime.now().isoformat(timespec="seconds")
+    print(f"[strawberry-server] {stamp} job={job_id} {message}", flush=True)
+
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -164,10 +191,333 @@ def compact_targets(all_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     return compact
 
 
+def update_manifest(job_dir: Path, updates: Dict[str, Any]) -> None:
+    manifest = job_dir / "manifest.json"
+    current: Dict[str, Any] = {}
+    if manifest.exists():
+        current = read_json(manifest)
+    write_json(manifest, {**current, **updates})
+
+
+class GroundedSamEngine:
+    def __init__(self, settings: argparse.Namespace):
+        self.settings = settings
+        self.device = str(settings.device)
+        self.lock = threading.Lock()
+        bert_path = Path(settings.bert_base_uncased_path)
+        if not bert_path.is_dir():
+            raise PipelineError(
+                f"bert-base-uncased local path not found: {bert_path}. "
+                "Download it and symlink it to the project root before running Grounded-SAM.",
+                500,
+            )
+
+        started = time.monotonic()
+        print("[strawberry-server] loading GroundingDINO/SAM models into GPU", flush=True)
+        self.grounding_model = load_model(
+            str(settings.config),
+            str(settings.grounded_checkpoint),
+            str(settings.bert_base_uncased_path),
+            device=self.device,
+        ).to(self.device)
+        self.grounding_model.eval()
+        self.predictor = SamPredictor(
+            sam_model_registry["vit_h"](checkpoint=str(settings.sam_checkpoint)).to(self.device)
+        )
+        if self.device.startswith("cuda"):
+            torch.cuda.synchronize()
+        elapsed = time.monotonic() - started
+        print(f"[strawberry-server] models ready elapsed_s={elapsed:.2f}", flush=True)
+
+    def run(
+        self,
+        input_image: Path,
+        output_dir: Path,
+        text_prompt: str,
+        box_threshold: float,
+        text_threshold: float,
+    ) -> Dict[str, Any]:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        started = time.monotonic()
+        with self.lock, torch.inference_mode():
+            image_pil, image_tensor = load_image(str(input_image))
+            image_pil.save(output_dir / "raw_image.jpg")
+
+            boxes_filt, pred_phrases = get_grounding_output(
+                self.grounding_model,
+                image_tensor,
+                text_prompt,
+                box_threshold,
+                text_threshold,
+                device=self.device,
+            )
+
+            image = cv2.imread(str(input_image))
+            if image is None:
+                raise PipelineError(f"failed to read image for inference: {input_image}", 500)
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            self.predictor.set_image(image)
+
+            width, height = image_pil.size
+            boxes_xyxy = boxes_filt.clone()
+            for index in range(boxes_xyxy.size(0)):
+                boxes_xyxy[index] = boxes_xyxy[index] * torch.Tensor([width, height, width, height])
+                boxes_xyxy[index][:2] -= boxes_xyxy[index][2:] / 2
+                boxes_xyxy[index][2:] += boxes_xyxy[index][:2]
+
+            boxes_xyxy = boxes_xyxy.cpu()
+            transformed_boxes = self.predictor.transform.apply_boxes_torch(
+                boxes_xyxy, image.shape[:2]
+            ).to(self.device)
+
+            masks, _, _ = self.predictor.predict_torch(
+                point_coords=None,
+                point_labels=None,
+                boxes=transformed_boxes.to(self.device),
+                multimask_output=False,
+            )
+
+            plt.figure(figsize=(10, 10))
+            plt.imshow(image)
+            for mask in masks:
+                show_mask(mask.cpu().numpy(), plt.gca(), random_color=True)
+            for box, label in zip(boxes_xyxy, pred_phrases):
+                show_box(box.numpy(), plt.gca(), label)
+            plt.axis("off")
+            plt.savefig(
+                output_dir / "grounded_sam_output.jpg",
+                bbox_inches="tight",
+                dpi=300,
+                pad_inches=0.0,
+            )
+            plt.close()
+
+            save_mask_data(str(output_dir), masks, boxes_xyxy, pred_phrases)
+            plt.close("all")
+            if self.device.startswith("cuda"):
+                torch.cuda.synchronize()
+
+        return {"elapsed_s": time.monotonic() - started, "output": "in-process"}
+
+
+def run_pipeline_job(
+    settings: argparse.Namespace,
+    engine: GroundedSamEngine,
+    job_dir: Path,
+    raw_image_path: Path,
+    metadata_path: Path,
+    raw_sha256: str,
+    image_info: Dict[str, Any],
+    metadata_json: Dict[str, Any],
+    started: float,
+) -> Dict[str, Any]:
+    raw_output_dir = job_dir / "output_raw"
+    output_dir = job_dir / "output" / f"outputs_multi_auto_{job_dir.name}"
+
+    log_event(job_dir.name, "stage=grounded_sam starting Grounded-SAM")
+    update_manifest(
+        job_dir,
+        {
+            "status": "running",
+            "stage": "grounded_sam",
+            "stage_message": "running Grounded-SAM detection and segmentation",
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        },
+    )
+
+    ground_result = engine.run(
+        raw_image_path,
+        raw_output_dir,
+        str(settings.text_prompt),
+        float(settings.box_threshold),
+        float(settings.text_threshold),
+    )
+
+    masks = sorted(raw_output_dir.glob("mask_*.png"))
+    if not masks:
+        raise PipelineError("no strawberry detected", 422)
+
+    log_event(job_dir.name, f"stage=grasp_generation masks={len(masks)}")
+    update_manifest(
+        job_dir,
+        {
+            "stage": "grasp_generation",
+            "stage_message": f"generating grasp points for {len(masks)} masks",
+            "mask_count": len(masks),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        },
+    )
+
+    grasp_cmd = [
+        sys.executable,
+        "tools/generate_multi_strawberry_grasps.py",
+        "--sam-output-dir",
+        str(raw_output_dir),
+        "--output-dir",
+        str(output_dir),
+        "--layout",
+        "triangle-paired",
+        "--thumb-side",
+        "top",
+        "--overwrite",
+    ]
+    grasp_result = run_command(grasp_cmd, timeout_s=60)
+
+    copy_original_raw_image(raw_image_path, raw_output_dir)
+    copy_original_raw_image(raw_image_path, output_dir)
+    all_data = read_json(output_dir / "all_grasp_points.json")
+    targets = compact_targets(all_data)
+    if not targets:
+        raise PipelineError("mask count is zero after grasp generation", 422)
+    if all(target.get("status") != "ok" for target in targets):
+        raise PipelineError("grasp point generation failed for all targets", 500)
+
+    zip_path = create_result_zip(job_dir, output_dir)
+    log_event(job_dir.name, f"stage=done targets={len(targets)} zip={zip_path}")
+    total_time_s = time.monotonic() - started
+    response = {
+        "job_id": job_dir.name,
+        "status": "done",
+        "stage": "done",
+        "raw_image_sha256": raw_sha256,
+        "width": image_info["width"],
+        "height": image_info["height"],
+        "target_count": len(targets),
+        "failed_targets": all_data.get("failed_targets", 0),
+        "targets": targets,
+        "server_output_dir": str(output_dir),
+        "all_grasp_points_json": str(output_dir / "all_grasp_points.json"),
+        "result_zip_url": f"/api/strawberry/jobs/{job_dir.name}/result.zip",
+        "timing": {
+            "grounded_sam_s": ground_result["elapsed_s"],
+            "grasp_generation_s": grasp_result["elapsed_s"],
+            "total_s": total_time_s,
+        },
+    }
+    write_json(
+        job_dir / "manifest.json",
+        {
+            **response,
+            "status": "done",
+            "input_image": str(raw_image_path),
+            "input_metadata": str(metadata_path),
+            "metadata": metadata_json,
+            "raw_output_dir": str(raw_output_dir),
+            "result_zip": str(zip_path),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        },
+    )
+    return response
+
+
+def run_pipeline_job_background(
+    settings: argparse.Namespace,
+    engine: GroundedSamEngine,
+    job_dir: Path,
+    raw_image_path: Path,
+    metadata_path: Path,
+    raw_sha256: str,
+    image_info: Dict[str, Any],
+    metadata_json: Dict[str, Any],
+    started: float,
+) -> None:
+    try:
+        run_pipeline_job(
+            settings,
+            engine,
+            job_dir,
+            raw_image_path,
+            metadata_path,
+            raw_sha256,
+            image_info,
+            metadata_json,
+            started,
+        )
+    except PipelineError as exc:
+        log_event(job_dir.name, f"stage=failed error={exc}")
+        update_manifest(
+            job_dir,
+            {
+                "status": "failed",
+                "stage": "failed",
+                "error": str(exc),
+                "status_code": exc.status_code,
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            },
+        )
+    except Exception as exc:
+        log_event(job_dir.name, f"stage=failed error={exc}")
+        update_manifest(
+            job_dir,
+            {
+                "status": "failed",
+                "stage": "failed",
+                "error": str(exc),
+                "status_code": 500,
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            },
+        )
+
+
+async def prepare_job(
+    jobs_dir: Path,
+    image: UploadFile,
+    metadata: UploadFile,
+) -> Dict[str, Any]:
+    job_id = make_job_id()
+    job_dir = jobs_dir / job_id
+    input_dir = job_dir / "input"
+    input_dir.mkdir(parents=True, exist_ok=False)
+
+    image_bytes = await image.read()
+    metadata_bytes = await metadata.read()
+    image_info = validate_image_bytes(image_bytes)
+
+    raw_image_path = input_dir / "raw_image.jpg"
+    metadata_path = input_dir / "metadata.json"
+    raw_image_path.write_bytes(image_bytes)
+    metadata_path.write_bytes(metadata_bytes)
+
+    try:
+        metadata_json = json.loads(metadata_bytes.decode("utf-8"))
+    except Exception as exc:
+        raise PipelineError("metadata is not valid UTF-8 JSON") from exc
+
+    raw_sha256 = sha256_bytes(image_bytes)
+    log_event(job_id, "stage=accepted request received and input saved")
+    write_json(
+        job_dir / "manifest.json",
+        {
+            "job_id": job_id,
+            "status": "accepted",
+            "stage": "accepted",
+            "stage_message": "request received and input files saved",
+            "raw_image_sha256": raw_sha256,
+            "metadata": metadata_json,
+            "input_image": str(raw_image_path),
+            "input_metadata": str(metadata_path),
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            **image_info,
+        },
+    )
+    return {
+        "job_id": job_id,
+        "job_dir": job_dir,
+        "raw_image_path": raw_image_path,
+        "metadata_path": metadata_path,
+        "raw_sha256": raw_sha256,
+        "image_info": image_info,
+        "metadata_json": metadata_json,
+        "started": time.monotonic(),
+    }
+
+
 def build_app(args: Optional[argparse.Namespace] = None) -> FastAPI:
     settings = args or parse_args()
     jobs_dir = Path(settings.jobs_dir).resolve()
     jobs_dir.mkdir(parents=True, exist_ok=True)
+    engine = GroundedSamEngine(settings)
 
     app = FastAPI(title="Strawberry Multi-Grasp Server", version="1.0")
 
@@ -178,6 +528,7 @@ def build_app(args: Optional[argparse.Namespace] = None) -> FastAPI:
             "project_root": str(PROJECT_ROOT),
             "jobs_dir": str(jobs_dir),
             "device": settings.device,
+            "model_loaded": True,
         }
 
     @app.post("/api/strawberry/multi_grasp")
@@ -186,126 +537,22 @@ def build_app(args: Optional[argparse.Namespace] = None) -> FastAPI:
         metadata: UploadFile = File(...),
         return_format: str = Form("json"),
     ):
-        job_id = make_job_id()
-        job_dir = jobs_dir / job_id
-        input_dir = job_dir / "input"
-        raw_output_dir = job_dir / "output_raw"
-        output_dir = job_dir / "output" / f"outputs_multi_auto_{job_id}"
-        input_dir.mkdir(parents=True, exist_ok=False)
-
-        started = time.monotonic()
         try:
-            image_bytes = await image.read()
-            metadata_bytes = await metadata.read()
-            image_info = validate_image_bytes(image_bytes)
-
-            raw_image_path = input_dir / "raw_image.jpg"
-            metadata_path = input_dir / "metadata.json"
-            raw_image_path.write_bytes(image_bytes)
-            metadata_path.write_bytes(metadata_bytes)
-
-            try:
-                metadata_json = json.loads(metadata_bytes.decode("utf-8"))
-            except Exception as exc:
-                raise PipelineError("metadata is not valid UTF-8 JSON") from exc
-
-            raw_sha256 = sha256_bytes(image_bytes)
-            write_json(
-                job_dir / "manifest.json",
-                {
-                    "job_id": job_id,
-                    "status": "running",
-                    "raw_image_sha256": raw_sha256,
-                    "metadata": metadata_json,
-                    **image_info,
-                },
+            job = await prepare_job(jobs_dir, image, metadata)
+            response = run_pipeline_job(
+                settings,
+                engine,
+                job["job_dir"],
+                job["raw_image_path"],
+                job["metadata_path"],
+                job["raw_sha256"],
+                job["image_info"],
+                job["metadata_json"],
+                job["started"],
             )
-
-            ground_cmd = [
-                sys.executable,
-                "grounded_sam_demo.py",
-                "--config",
-                str(settings.config),
-                "--grounded_checkpoint",
-                str(settings.grounded_checkpoint),
-                "--sam_checkpoint",
-                str(settings.sam_checkpoint),
-                "--input_image",
-                str(raw_image_path),
-                "--output_dir",
-                str(raw_output_dir),
-                "--box_threshold",
-                str(settings.box_threshold),
-                "--text_threshold",
-                str(settings.text_threshold),
-                "--text_prompt",
-                str(settings.text_prompt),
-                "--device",
-                str(settings.device),
-            ]
-            ground_result = run_command(ground_cmd, timeout_s=180)
-
-            masks = sorted(raw_output_dir.glob("mask_*.png"))
-            if not masks:
-                raise PipelineError("no strawberry detected", 422)
-
-            grasp_cmd = [
-                sys.executable,
-                "tools/generate_multi_strawberry_grasps.py",
-                "--sam-output-dir",
-                str(raw_output_dir),
-                "--output-dir",
-                str(output_dir),
-                "--layout",
-                "triangle-paired",
-                "--thumb-side",
-                "top",
-                "--overwrite",
-            ]
-            grasp_result = run_command(grasp_cmd, timeout_s=60)
-
-            copy_original_raw_image(raw_image_path, raw_output_dir)
-            copy_original_raw_image(raw_image_path, output_dir)
-            all_data = read_json(output_dir / "all_grasp_points.json")
-            targets = compact_targets(all_data)
-            if not targets:
-                raise PipelineError("mask count is zero after grasp generation", 422)
-            if all(target.get("status") != "ok" for target in targets):
-                raise PipelineError("grasp point generation failed for all targets", 500)
-
-            zip_path = create_result_zip(job_dir, output_dir)
-            total_time_s = time.monotonic() - started
-            response = {
-                "job_id": job_id,
-                "status": "done",
-                "raw_image_sha256": raw_sha256,
-                "width": image_info["width"],
-                "height": image_info["height"],
-                "target_count": len(targets),
-                "failed_targets": all_data.get("failed_targets", 0),
-                "targets": targets,
-                "server_output_dir": str(output_dir),
-                "all_grasp_points_json": str(output_dir / "all_grasp_points.json"),
-                "result_zip_url": f"/api/strawberry/jobs/{job_id}/result.zip",
-                "timing": {
-                    "grounded_sam_s": ground_result["elapsed_s"],
-                    "grasp_generation_s": grasp_result["elapsed_s"],
-                    "total_s": total_time_s,
-                },
-            }
-            write_json(
-                job_dir / "manifest.json",
-                {
-                    **response,
-                    "status": "done",
-                    "input_image": str(raw_image_path),
-                    "input_metadata": str(metadata_path),
-                    "raw_output_dir": str(raw_output_dir),
-                    "result_zip": str(zip_path),
-                },
-            )
-
             if return_format.lower() == "zip":
+                zip_path = job["job_dir"] / "result.zip"
+                output_dir = Path(response["server_output_dir"])
                 return FileResponse(
                     zip_path,
                     media_type="application/zip",
@@ -313,11 +560,59 @@ def build_app(args: Optional[argparse.Namespace] = None) -> FastAPI:
                 )
             return response
         except PipelineError as exc:
-            error = {"job_id": job_id, "status": "failed", "error": str(exc)}
+            job_id = locals().get("job", {}).get("job_id", make_job_id())
+            job_dir = locals().get("job", {}).get("job_dir", jobs_dir / job_id)
+            log_event(job_id, f"stage=failed error={exc}")
+            error = {"job_id": job_id, "status": "failed", "stage": "failed", "error": str(exc)}
             write_json(job_dir / "manifest.json", error)
             return JSONResponse(status_code=exc.status_code, content=error)
         except Exception as exc:
-            error = {"job_id": job_id, "status": "failed", "error": str(exc)}
+            job_id = locals().get("job", {}).get("job_id", make_job_id())
+            job_dir = locals().get("job", {}).get("job_dir", jobs_dir / job_id)
+            log_event(job_id, f"stage=failed error={exc}")
+            error = {"job_id": job_id, "status": "failed", "stage": "failed", "error": str(exc)}
+            write_json(job_dir / "manifest.json", error)
+            return JSONResponse(status_code=500, content=error)
+
+    @app.post("/api/strawberry/multi_grasp_async")
+    async def multi_grasp_async(
+        background_tasks: BackgroundTasks,
+        image: UploadFile = File(...),
+        metadata: UploadFile = File(...),
+        return_format: str = Form("json"),
+    ):
+        try:
+            job = await prepare_job(jobs_dir, image, metadata)
+            background_tasks.add_task(
+                run_pipeline_job_background,
+                settings,
+                engine,
+                job["job_dir"],
+                job["raw_image_path"],
+                job["metadata_path"],
+                job["raw_sha256"],
+                job["image_info"],
+                job["metadata_json"],
+                job["started"],
+            )
+            return {
+                "job_id": job["job_id"],
+                "status": "accepted",
+                "stage": "accepted",
+                "message": "request received; poll job_status_url for progress",
+                "job_status_url": f"/api/strawberry/jobs/{job['job_id']}",
+                "result_zip_url": f"/api/strawberry/jobs/{job['job_id']}/result.zip",
+            }
+        except PipelineError as exc:
+            job_id = locals().get("job", {}).get("job_id", make_job_id())
+            job_dir = locals().get("job", {}).get("job_dir", jobs_dir / job_id)
+            error = {"job_id": job_id, "status": "failed", "stage": "failed", "error": str(exc)}
+            write_json(job_dir / "manifest.json", error)
+            return JSONResponse(status_code=exc.status_code, content=error)
+        except Exception as exc:
+            job_id = locals().get("job", {}).get("job_id", make_job_id())
+            job_dir = locals().get("job", {}).get("job_dir", jobs_dir / job_id)
+            error = {"job_id": job_id, "status": "failed", "stage": "failed", "error": str(exc)}
             write_json(job_dir / "manifest.json", error)
             return JSONResponse(status_code=500, content=error)
 
@@ -347,17 +642,6 @@ def build_app(args: Optional[argparse.Namespace] = None) -> FastAPI:
 
     return app
 
-
-app = build_app(argparse.Namespace(
-    jobs_dir=str(DEFAULT_JOBS_DIR),
-    device=DEFAULT_DEVICE,
-    box_threshold=0.3,
-    text_threshold=0.25,
-    text_prompt="strawberry",
-    config=str(DEFAULT_CONFIG),
-    grounded_checkpoint=str(DEFAULT_GROUNDED_CHECKPOINT),
-    sam_checkpoint=str(DEFAULT_SAM_CHECKPOINT),
-))
 
 
 if __name__ == "__main__":

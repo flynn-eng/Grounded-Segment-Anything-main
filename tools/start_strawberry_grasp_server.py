@@ -19,6 +19,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tries", type=int, default=50)
     parser.add_argument("--jobs-dir", default=str(PROJECT_ROOT / "strawberry_server_jobs"))
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--bert-base-uncased-path",
+        default=str(PROJECT_ROOT / "bert-base-uncased"),
+        help="Local HuggingFace bert-base-uncased directory for GroundingDINO.",
+    )
     return parser.parse_args()
 
 
@@ -58,6 +63,7 @@ def main() -> None:
             config=str(PROJECT_ROOT / "GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"),
             grounded_checkpoint=str(PROJECT_ROOT / "groundingdino_swint_ogc.pth"),
             sam_checkpoint=str(PROJECT_ROOT / "sam_vit_h_4b8939.pth"),
+            bert_base_uncased_path=args.bert_base_uncased_path,
         )
     )
     uvicorn.run(app, host=args.host, port=port)
