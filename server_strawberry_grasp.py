@@ -175,13 +175,15 @@ def compact_targets(all_data: Dict[str, Any]) -> List[Dict[str, Any]]:
                     if item.get("value") == 1:
                         score = item.get("logit")
                         break
+        mask_bbox_xywh = target.get("mask_bbox_xywh")
         item: Dict[str, Any] = {
             "id": target.get("target", f"target_{order:02d}"),
             "order": order,
             "status": target.get("status"),
             "source_mask_index": target.get("source_mask_index"),
             "sort_center": target.get("sort_center"),
-            "mask_bbox_xywh": target.get("mask_bbox_xywh"),
+            "mask_bbox_xywh": mask_bbox_xywh,
+            "diagnostics": {"bbox_xywh": mask_bbox_xywh},
             "grasp_points_2d": target.get("grasp_points_2d"),
             "grasp_pair_center_2d": target.get("grasp_pair_center_2d"),
             "direction_line_2d": target.get("direction_line_2d"),
@@ -324,6 +326,7 @@ def run_pipeline_job(
     image_info: Dict[str, Any],
     metadata_json: Dict[str, Any],
     started: float,
+    include_artifacts: bool = False,
 ) -> Dict[str, Any]:
     raw_output_dir = job_dir / "output_raw"
     output_dir = job_dir / "output" / f"outputs_multi_auto_{job_dir.name}"
@@ -386,8 +389,11 @@ def run_pipeline_job(
     if all(target.get("status") != "ok" for target in targets):
         raise PipelineError("grasp point generation failed for all targets", 500)
 
-    zip_path = create_result_zip(job_dir, output_dir)
-    log_event(job_dir.name, f"stage=done targets={len(targets)} zip={zip_path}")
+    zip_path: Optional[Path] = None
+    if include_artifacts:
+        zip_path = create_result_zip(job_dir, output_dir)
+    log_suffix = f" zip={zip_path}" if zip_path else " artifacts=omitted"
+    log_event(job_dir.name, f"stage=done targets={len(targets)}{log_suffix}")
     total_time_s = time.monotonic() - started
     response = {
         "job_id": job_dir.name,
@@ -401,26 +407,24 @@ def run_pipeline_job(
         "targets": targets,
         "server_output_dir": str(output_dir),
         "all_grasp_points_json": str(output_dir / "all_grasp_points.json"),
-        "result_zip_url": f"/api/strawberry/jobs/{job_dir.name}/result.zip",
         "timing": {
             "grounded_sam_s": ground_result["elapsed_s"],
             "grasp_generation_s": grasp_result["elapsed_s"],
             "total_s": total_time_s,
         },
     }
-    write_json(
-        job_dir / "manifest.json",
-        {
-            **response,
-            "status": "done",
-            "input_image": str(raw_image_path),
-            "input_metadata": str(metadata_path),
-            "metadata": metadata_json,
-            "raw_output_dir": str(raw_output_dir),
-            "result_zip": str(zip_path),
-            "updated_at": datetime.now().isoformat(timespec="seconds"),
-        },
-    )
+    manifest_extra: Dict[str, Any] = {
+        "status": "done",
+        "input_image": str(raw_image_path),
+        "input_metadata": str(metadata_path),
+        "metadata": metadata_json,
+        "raw_output_dir": str(raw_output_dir),
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    if zip_path is not None:
+        response["result_zip_url"] = f"/api/strawberry/jobs/{job_dir.name}/result.zip"
+        manifest_extra["result_zip"] = str(zip_path)
+    write_json(job_dir / "manifest.json", {**response, **manifest_extra})
     return response
 
 
@@ -434,6 +438,7 @@ def run_pipeline_job_background(
     image_info: Dict[str, Any],
     metadata_json: Dict[str, Any],
     started: float,
+    include_artifacts: bool = False,
 ) -> None:
     try:
         run_pipeline_job(
@@ -446,6 +451,7 @@ def run_pipeline_job_background(
             image_info,
             metadata_json,
             started,
+            include_artifacts=include_artifacts,
         )
     except PipelineError as exc:
         log_event(job_dir.name, f"stage=failed error={exc}")
@@ -553,6 +559,7 @@ def build_app(args: Optional[argparse.Namespace] = None) -> FastAPI:
     ):
         try:
             job = await prepare_job(jobs_dir, image, metadata)
+            return_format_lower = return_format.lower()
             response = run_pipeline_job(
                 settings,
                 engine,
@@ -563,8 +570,9 @@ def build_app(args: Optional[argparse.Namespace] = None) -> FastAPI:
                 job["image_info"],
                 job["metadata_json"],
                 job["started"],
+                include_artifacts=return_format_lower == "zip",
             )
-            if return_format.lower() == "zip":
+            if return_format_lower == "zip":
                 zip_path = job["job_dir"] / "result.zip"
                 output_dir = Path(response["server_output_dir"])
                 return FileResponse(
@@ -608,6 +616,7 @@ def build_app(args: Optional[argparse.Namespace] = None) -> FastAPI:
                 job["image_info"],
                 job["metadata_json"],
                 job["started"],
+                False,
             )
             return {
                 "job_id": job["job_id"],
@@ -615,7 +624,6 @@ def build_app(args: Optional[argparse.Namespace] = None) -> FastAPI:
                 "stage": "accepted",
                 "message": "request received; poll job_status_url for progress",
                 "job_status_url": f"/api/strawberry/jobs/{job['job_id']}",
-                "result_zip_url": f"/api/strawberry/jobs/{job['job_id']}/result.zip",
             }
         except PipelineError as exc:
             job_id = locals().get("job", {}).get("job_id", make_job_id())
